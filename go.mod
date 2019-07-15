@@ -33,7 +33,7 @@ require (
 	github.com/google/go-cmp v0.3.0
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/goreleaser/goreleaser v0.97.0
-	github.com/hashicorp/go-msgpack v0.0.0-20150518234257-fa3f63826f7c // indirect
+	github.com/hashicorp/go-msgpack v0.5.5 // indirect
 	github.com/hashicorp/raft v1.0.0 // indirect
 	github.com/hashicorp/vault/api v1.0.2
 	github.com/influxdata/flux v0.49.0
@@ -46,7 +46,6 @@ require (
 	github.com/k0kubun/colorstring v0.0.0-20150214042306-9440f1994b88 // indirect
 	github.com/kevinburke/go-bindata v3.11.0+incompatible
 	github.com/mattn/go-isatty v0.0.4
-	github.com/mattn/go-zglob v0.0.1 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.1
 	github.com/mna/pigeon v1.0.1-0.20180808201053-bb0192cfc2ae
 	github.com/mschoch/smat v0.0.0-20160514031455-90eadee771ae // indirect
@@ -56,8 +55,8 @@ require (
 	github.com/nats-io/nats-streaming-server v0.11.2
 	github.com/nats-io/nkeys v0.0.2 // indirect
 	github.com/nats-io/nuid v1.0.0 // indirect
-	github.com/onsi/ginkgo v1.7.0 // indirect
-	github.com/onsi/gomega v1.4.3 // indirect
+	github.com/onsi/ginkgo v1.10.1 // indirect
+	github.com/onsi/gomega v1.7.0 // indirect
 	github.com/opentracing/opentracing-go v1.1.0
 	github.com/philhofer/fwd v1.0.0 // indirect
 	github.com/pkg/errors v0.8.1
@@ -65,6 +64,8 @@ require (
 	github.com/prometheus/client_model v0.0.0-20190129233127-fd36f4220a90
 	github.com/prometheus/common v0.6.0
 	github.com/prometheus/procfs v0.0.3 // indirect
+	github.com/prometheus/prometheus v2.5.0+incompatible
+	github.com/prometheus/tsdb v0.9.1
 	github.com/satori/go.uuid v1.2.0
 	github.com/spf13/cast v1.2.0
 	github.com/spf13/cobra v0.0.3
@@ -93,10 +94,7 @@ require (
 	google.golang.org/api v0.7.0
 	google.golang.org/grpc v1.21.1
 	gopkg.in/robfig/cron.v2 v2.0.0-20150107220207-be2e0b0deed5
-	gopkg.in/vmihailenco/msgpack.v2 v2.9.1 // indirect
 	honnef.co/go/tools v0.0.1-2019.2.3.0.20190904154718-afd67930eec2
-	labix.org/v2/mgo v0.0.0-20140701140051-000000000287 // indirect
-	launchpad.net/gocheck v0.0.0-20140225173054-000000000087 // indirect
 )
 
 replace github.com/Sirupsen/logrus => github.com/sirupsen/logrus v1.2.0
