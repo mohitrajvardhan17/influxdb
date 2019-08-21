@@ -29,7 +29,6 @@ func (stdTime) Until(t time.Time) time.Duration {
 	return time.Until(t)
 }
 
-
 // NewTimer gives us a Timer that fires after duration d.
 func (stdTime) NewTimer(d time.Duration) Timer {
 	t := time.NewTimer(d)
@@ -86,9 +85,8 @@ func (_ MockTime) Unix(sec, nsec int64) time.Time {
 	return time.Unix(sec, nsec)
 }
 
-
 // Util is equivalent to  t.T.Sub(ts).  We need it to mock out time, because the non-mocked implementation needs to be monotonic.
-func(t MockTime) Until(ts time.Time) time.Duration{
+func (t MockTime) Until(ts time.Time) time.Duration {
 	return t.T.Sub(ts)
 }
 
@@ -101,37 +99,39 @@ func (t *MockTime) NewTimer(d time.Duration) Timer {
 	timer := &MockTimer{
 		T:        t,
 		fireTime: t.T.Add(d),
-		stopch:   make(chan struct{}, 1),
+		stopch:   make(chan struct{}),
 		c:        make(chan time.Time),
 	}
-	go func() {
-		for {
-			t.Cond.Wait()
-			t.RLock()
-			ts := t.T
-			ft := timer.fireTime
-			t.RUnlock()
-			select {
-			case <-timer.stopch:
-				t.Lock()
-				timer.fireTime = time.Time{}
-				t.Unlock()
-			default:
-			}
-			if (!ft.IsZero()) && !ft.After(ts) {
-				select {
-				case timer.c <- ft:
-				default:
-				}
-				t.Lock()
-				timer.fireTime = time.Time{}
-				t.Unlock()
-			}
-		}
-	}()
+	go timer.start(d)
 	t.Cond.L.Lock()
 
 	return timer
+}
+
+func (t *MockTimer) start(ts time.Duration) {
+	for {
+		t.T.Cond.Wait()
+		t.T.RLock()
+		ts := t.T.T
+		ft := t.fireTime
+		t.T.RUnlock()
+		select {
+		case <-t.stopch:
+			t.T.Lock()
+			t.fireTime = time.Time{}
+			t.T.Unlock()
+		default:
+		}
+		if (!ft.IsZero()) && !ft.After(ts) {
+			select {
+			case t.c <- ft:
+			default:
+			}
+			t.T.Lock()
+			t.fireTime = time.Time{}
+			t.T.Unlock()
+		}
+	}
 }
 
 // Set sets the underlying time to ts.  It is used when mocking time out.  It is threadsafe.
@@ -169,8 +169,12 @@ func (t *MockTimer) Reset(d time.Duration) bool {
 	t.Lock()
 	defer t.Unlock()
 	t.T.T = t.T.T.Add(d)
+	if t.fireTime.IsZero() {
+		t.start(d)
+		return false
+	}
 	t.T.Cond.Broadcast()
-	t.stopch = make(chan struct{}, 1)
+	t.stopch = make(chan struct{})
 	return !t.fireTime.IsZero()
 }
 

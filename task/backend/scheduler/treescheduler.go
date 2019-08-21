@@ -3,17 +3,23 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"github.com/influxdata/influxdb/task/backend"
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/influxdata/influxdb/task/backend"
 
 	"github.com/google/btree"
 	"github.com/influxdata/cron"
 )
 
-const cancelTimeOut = 30 * time.Second
+const (
+	cancelTimeOut = 30 * time.Second
 
-const defaultMaxRunsOutstanding = 1 << 16
+	degreeBtreeScheduled      = 3
+	degreeBtreeRunning        = 3
+	defaultMaxRunsOutstanding = 1 << 16
+)
 
 type runningItem struct {
 	cancel func(ctx context.Context)
@@ -29,8 +35,8 @@ func (it runningItem) Less(bItem btree.Item) bool {
 // TreeScheduler is a Scheduler based on a btree
 type TreeScheduler struct {
 	sync.RWMutex
-	scheduled btree.BTree
-	running   btree.BTree
+	scheduled *btree.BTree
+	running   *btree.BTree
 	nextTime  map[ID]int64 // we need this index so we can delete items from the scheduled
 	when      time.Time
 	executor  func(ctx context.Context, id ID, scheduledAt time.Time) (Promise, error)
@@ -104,10 +110,12 @@ func WithTime(t Time) treeSchedulerOptFunc {
 // OnErr is a function that takes am error, it is called when we cannot find a viable time before jan 1, 2100.  The default behavior is to drop the task on error.
 func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeScheduler, *SchedulerMetrics, error) {
 	s := &TreeScheduler{
-		executor: Executor,
-		onErr:    func(_ context.Context, _ ID, _ ID, _ time.Time, _ error) bool { return true },
-		sema:     make(chan struct{}, defaultMaxRunsOutstanding),
-		time: stdTime{},
+		executor:  Executor,
+		scheduled: btree.New(degreeBtreeScheduled),
+		running:   btree.New(degreeBtreeRunning),
+		onErr:     func(_ context.Context, _ ID, _ ID, _ time.Time, _ error) bool { return true },
+		sema:      make(chan struct{}, defaultMaxRunsOutstanding),
+		time:      stdTime{},
 	}
 
 	// apply options
@@ -125,20 +133,24 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 	}
 	go func() {
 		for {
+			fmt.Println("here 0")
 			select {
 			case <-s.done:
 				s.Lock()
 				s.timer.Stop()
 				s.Unlock()
 				close(s.sema)
+				fmt.Println("here 1")
 				return
 			case <-s.timer.C():
+				fmt.Println("here 2")
 				iti := s.scheduled.DeleteMin()
+				fmt.Println("here 3")
 				if iti == nil {
 					s.Lock()
-					if !s.timer.Stop(){
-						<-s.timer.C()
-					}
+					//if !s.timer.Stop() {
+					//	<-s.timer.C()
+					//}
 					s.timer.Reset(maxWaitTime)
 					s.Unlock()
 					continue
@@ -168,6 +180,7 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 				s.wg.Add(1)
 				s.sema <- struct{}{}
 				go func(it item, prom Promise) {
+					fmt.Println("here 4")
 					defer func() {
 						s.wg.Done()
 						<-s.sema
@@ -185,7 +198,7 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 					s.sm.finishExecution(it.id, prom.Error() == nil, backend.RunStarted, time.Since(time.Unix(it.next, 0)))
 
 					if err = prom.Error(); err != nil {
-						s.onErr (context.Background(), it.id, 0, time.Unix(it.next, 0), err)
+						s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
 						return
 					}
 				}(it, prom)
@@ -254,21 +267,26 @@ func (s *TreeScheduler) Schedule(id ID, cronString string, offset time.Duration,
 		next: nt.Add(offset).Unix(),
 		id:   id,
 	}
+	fmt.Println("thing done 3")
+
 	s.Lock()
 	defer s.Unlock()
-	nextTime, ok := s.nextTime[id]
-	if !ok {
-		s.scheduled.ReplaceOrInsert(it)
-		return nil
-	}
 
-	if s.when.Before(nt) {
+	if s.when.After(nt) {
+		fmt.Println("thing done")
 		s.when = nt
 		if !s.timer.Stop() {
 			<-s.timer.C()
 		}
 		s.timer.Reset(time.Until(s.when))
 	}
+	nextTime, ok := s.nextTime[id]
+	if !ok {
+		fmt.Println("thing done 4")
+		s.scheduled.ReplaceOrInsert(it)
+		return nil
+	}
+	fmt.Println("thing done 2")
 
 	// delete the old task run time
 	s.scheduled.Delete(item{

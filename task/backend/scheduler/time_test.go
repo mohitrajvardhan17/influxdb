@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -32,6 +33,21 @@ func TestMockTimer(t *testing.T) {
 	default:
 	}
 	go mt.Set(timeForComparison.Add(10 * time.Second))
+	select {
+	case <-timer.C():
+	case <-time.After(10 * time.Second):
+		t.Error("expected timer to fire when time was up, but it didn't, it fired after a 10 second timeout")
+	}
+	if !timer.Stop() {
+		fmt.Println("here1")
+		<-timer.C()
+		fmt.Println("here2")
+	}
+	timer.Reset(33 * time.Second)
+	go mt.Set(timeForComparison.Add(50 * time.Second))
+	fmt.Println("here")
+	fmt.Println("here0")
+
 	select {
 	case <-timer.C():
 	case <-time.After(10 * time.Second):
