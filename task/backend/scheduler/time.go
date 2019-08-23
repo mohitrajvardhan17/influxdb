@@ -152,7 +152,6 @@ func (t *MockTime) Get() time.Time {
 
 // MockTimer is a struct to mock out Timer.
 type MockTimer struct {
-	sync.RWMutex
 	T        *MockTime
 	fireTime time.Time
 	c        chan time.Time
@@ -166,8 +165,8 @@ func (t *MockTimer) C() <-chan time.Time {
 
 // Reset changes the timer to expire after duration d. It returns true if the timer had been active, false if the timer had expired or been stopped.
 func (t *MockTimer) Reset(d time.Duration) bool {
-	t.Lock()
-	defer t.Unlock()
+	t.T.Lock()
+	defer t.T.Unlock()
 	t.T.T = t.T.T.Add(d)
 	if t.fireTime.IsZero() {
 		t.start(d)
@@ -190,8 +189,8 @@ func (t *MockTimer) Reset(d time.Duration) bool {
 
 // This should not be done concurrent to other receives from the Timer's channel.
 func (t *MockTimer) Stop() bool {
-	t.RLock()
-	defer t.RUnlock()
+	t.T.RLock()
+	defer t.T.RUnlock()
 	if t.fireTime.IsZero() {
 		return false
 	}
