@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"log"
 	"testing"
 	"time"
 )
@@ -26,32 +27,46 @@ func TestMockTimer(t *testing.T) {
 	timeForComparison := time.Date(2016, 2, 3, 4, 5, 6, 7, time.UTC)
 	mt := NewMockTime(timeForComparison)
 	timer := mt.NewTimer(10 * time.Second)
+	log.Println("here 1")
 	select {
 	case <-timer.C():
 		t.Fatalf("expected timer not to fire till time was up, but did")
 	default:
+		log.Println("here 3")
 	}
 	go mt.Set(timeForComparison.Add(10 * time.Second))
 	select {
 	case <-timer.C():
-	case <-time.After(10 * time.Second):
-		t.Error("expected timer to fire when time was up, but it didn't, it fired after a 10 second timeout")
+		log.Println("here 2")
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected timer to fire when time was up, but it didn't, it fired after a 3 second timeout")
 	}
-	//if !timer.Stop() {
-	//	fmt.Println("here1")
-	//	<-timer.C()
-	//	fmt.Println("here2")
-	//}
-	//timer.Reset(33 * time.Second)
-	//go mt.Set(timeForComparison.Add(50 * time.Second))
-	//fmt.Println("here")
-	//fmt.Println("here0")
-	//
-	//select {
-	//case <-timer.C():
-	//case <-time.After(10 * time.Second):
-	//	t.Error("expected timer to fire when time was up, but it didn't, it fired after a 10 second timeout")
-	//}
+	timer.Reset(33 * time.Second)
+	log.Println("here 4")
+	go mt.Set(timeForComparison.Add(50 * time.Second))
+	log.Println("here 5")
+	select {
+	case <-timer.C():
+		log.Println("here 5")
+	case <-time.After(4 * time.Second):
+		t.Fatal("expected timer to fire when time was up, but it didn't, it fired after a 4 second timeout")
+	}
+	log.Println("here 6")
+	timer.Reset(10000 * time.Second)
+	select {
+	case <-timer.C():
+		t.Error("expected timer to NOT fire if time was not up, but it did")
+	default:
+	}
+
+	timer2 := mt.NewTimer(10000 * time.Second)
+	select {
+	case <-timer2.C():
+		t.Error("expected timer to NOT fire if time was not up, but it did")
+	case <-time.After(time.Second):
+	default:
+	}
+
 }
 
 func TestMockTimer_Stop(t *testing.T) {
@@ -64,15 +79,20 @@ func TestMockTimer_Stop(t *testing.T) {
 	if timer.Stop() {
 		t.Fatalf("Expected MockTimer.Stop() to be false when it was already stopped but it wasn't")
 	}
-	timer.Reset(10 * time.Second)
-	mt.Set(timeForComparison.Add(10 * time.Second))
+	timer.Reset(12 * time.Second)
+	mt.Set(timeForComparison.Add(20 * time.Second))
 	if timer.Stop() {
 		t.Fatalf("Expected MockTimer.Stop() to be false when it was already fired but it wasn't")
 	}
 }
 
 func TestTimer(t *testing.T) {
-	timer := time.NewTimer(30 * time.Second)
-	timer.Stop()
-
+	timer := time.NewTimer(1 * time.Second)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	timer.Reset(10 * time.Second)
+	if !timer.Stop() {
+		<-timer.C
+	}
 }

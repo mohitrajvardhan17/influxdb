@@ -13,6 +13,8 @@ import (
 // TODO(lh): maybe make this its own thing sometime in the future.
 type ID influxdb.ID
 
+var maxID = ID(int(^uint(0) >> 1))
+
 // Checkpointer allows us to restart a service from the last time we executed.
 type Checkpointer interface {
 	// Checkpoint saves the last checkpoint a id has reached.

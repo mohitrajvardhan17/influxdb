@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -57,19 +59,16 @@ func (t *stdTimer) C() <-chan time.Time {
 // Use NewMockTime to create Mocktimes, don't instanciate the struct directly unless you want to mess with the sync Cond.
 type MockTime struct {
 	sync.RWMutex
-	sync.Cond
+	*sync.Cond
 	T time.Time
 }
 
 // NewMockTime create a mock of time that returns the underlying time.Time.
 func NewMockTime(t time.Time) *MockTime {
 	mt := &MockTime{
-		Cond: sync.Cond{
-			L: &sync.Mutex{},
-		},
-		T: t,
+		T:    t,
+		Cond: sync.NewCond(&sync.Mutex{}),
 	}
-	mt.Cond.L.Lock() // so we can immediately call wait
 	return mt
 }
 
@@ -99,48 +98,68 @@ func (t *MockTime) NewTimer(d time.Duration) Timer {
 	timer := &MockTimer{
 		T:        t,
 		fireTime: t.T.Add(d),
-		stopch:   make(chan struct{}),
-		c:        make(chan time.Time),
+		stopch:   make(chan struct{}, 1),
+		c:        make(chan time.Time, 1),
 	}
 	go timer.start(d)
-	t.Cond.L.Lock()
-
 	return timer
 }
 
 func (t *MockTimer) start(ts time.Duration) {
+	t.T.Lock()
+	t.active = true
+	t.T.Unlock()
 	for {
-		t.T.Cond.Wait()
-		t.T.RLock()
-		ts := t.T.T
-		ft := t.fireTime
-		t.T.RUnlock()
+		t.T.Cond.L.Lock()
+		for t.T.Get().Before(t.fireTime) {
+			t.T.Wait()
+		}
 		select {
-		case <-t.stopch:
+		case t.c <- t.fireTime:
+			log.Println("firing")
 			t.T.Lock()
-			t.fireTime = time.Time{}
+			t.active = false
 			t.T.Unlock()
+		case <-t.stopch:
+			log.Println("stopping")
+			t.T.Cond.L.Unlock()
+			return
 		default:
 		}
-		if (!ft.IsZero()) && !ft.After(ts) {
-			select {
-			case t.c <- ft:
-			default:
-			}
-			t.T.Lock()
-			t.fireTime = time.Time{}
-			t.T.Unlock()
-		}
+		t.T.Cond.L.Unlock()
+
 	}
+	//for {t.T.Cond.
+	//	t.T.Cond.Wait()
+	//	t.T.RLock()
+	//	ts := t.T.T
+	//	ft := t.fireTime
+	//	t.T.RUnlock()
+	//	select {
+	//	case <-t.stopch:
+	//		t.T.Lock()
+	//		t.fireTime = time.Time{}
+	//		t.T.Unlock()
+	//	default:
+	//	}
+	//	if (!ft.IsZero()) && !ft.After(ts) {
+	//		select {
+	//		case t.c <- ft:
+	//		default:
+	//		}
+	//		t.T.Lock()
+	//		t.fireTime = time.Time{}
+	//		t.T.Unlock()
+	//	}
+	//}
 }
 
 // Set sets the underlying time to ts.  It is used when mocking time out.  It is threadsafe.
 func (t *MockTime) Set(ts time.Time) {
 	t.Lock()
-	defer t.Unlock()
 	t.T = ts
 	t.Cond.Broadcast()
-	t.Cond.L.Unlock()
+	t.Unlock()
 }
 
 // Get gets the underlying time in a threadsafe way.
@@ -156,6 +175,7 @@ type MockTimer struct {
 	fireTime time.Time
 	c        chan time.Time
 	stopch   chan struct{}
+	active   bool
 }
 
 // C returns a <chan time.Time, it is analogous to time.Timer.C.
@@ -167,14 +187,18 @@ func (t *MockTimer) C() <-chan time.Time {
 func (t *MockTimer) Reset(d time.Duration) bool {
 	t.T.Lock()
 	defer t.T.Unlock()
-	t.T.T = t.T.T.Add(d)
-	if t.fireTime.IsZero() {
-		t.start(d)
+	t.fireTime = t.fireTime.Add(d)
+	if !t.active {
+		t.stopch = make(chan struct{}, 1)
+		t.active = true
+		go t.start(d)
 		return false
 	}
-	t.T.Cond.Broadcast()
-	t.stopch = make(chan struct{})
-	return !t.fireTime.IsZero()
+	fmt.Println("here 99")
+	//t.T.Cond.Broadcast()
+
+	log.Println("here here 7")
+	return t.active
 }
 
 // Stop prevents the Timer from firing. It returns true if the call stops the timer, false if the timer has already
@@ -191,13 +215,12 @@ func (t *MockTimer) Reset(d time.Duration) bool {
 func (t *MockTimer) Stop() bool {
 	t.T.RLock()
 	defer t.T.RUnlock()
-	if t.fireTime.IsZero() {
+	if t.active {
 		return false
 	}
-
 	select {
 	case t.stopch <- struct{}{}:
-		t.fireTime = time.Time{}
+		t.active = false
 		return true
 	default:
 		return false

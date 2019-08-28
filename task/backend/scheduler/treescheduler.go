@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -14,8 +16,8 @@ import (
 )
 
 const (
-	cancelTimeOut = 30 * time.Second
-
+	cancelTimeOut             = 30 * time.Second
+	maxWaitTime               = time.Hour
 	degreeBtreeScheduled      = 3
 	degreeBtreeRunning        = 3
 	defaultMaxRunsOutstanding = 1 << 16
@@ -77,8 +79,6 @@ func (s *TreeScheduler) runs(taskID ID, limit int) (btree.ItemIterator, []ID) {
 	}, acc
 }
 
-const maxWaitTime = 1000000 * time.Hour
-
 type ExecutorFunc func(ctx context.Context, id ID, scheduledAt time.Time) (Promise, error)
 
 type ErrorFunc func(ctx context.Context, taskID ID, runID ID, scheduledAt time.Time, err error) bool
@@ -116,6 +116,7 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 		onErr:     func(_ context.Context, _ ID, _ ID, _ time.Time, _ error) bool { return true },
 		sema:      make(chan struct{}, defaultMaxRunsOutstanding),
 		time:      stdTime{},
+		done:      make(chan struct{}, 1),
 	}
 
 	// apply options
@@ -127,23 +128,30 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 
 	s.sm = NewSchedulerMetrics(s)
 	s.when = s.time.Now().Add(maxWaitTime)
-	s.timer = s.time.NewTimer(s.time.Until(s.when)) //time.Until(s.when))
+	s.timer = s.time.NewTimer(maxWaitTime)
 	if Executor == nil {
 		return nil, nil, errors.New("Executor must be a non-nil function")
 	}
+
+	log.Println("stopping! q1")
+
 	go func() {
+		log.Println("stopping! q2")
+	mainSchedLoop:
 		for {
-			fmt.Println("here 0")
+			fmt.Println("here 0", s.when)
 			select {
 			case <-s.done:
+				fmt.Println("here 12")
 				s.Lock()
 				s.timer.Stop()
+				fmt.Println("here 11")
 				s.Unlock()
 				close(s.sema)
 				fmt.Println("here 1")
 				return
 			case <-s.timer.C():
-				fmt.Println("here 2")
+				fmt.Println("here 2 fired")
 				iti := s.scheduled.DeleteMin()
 				fmt.Println("here 3")
 				if iti == nil {
@@ -153,7 +161,7 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 					//}
 					s.timer.Reset(maxWaitTime)
 					s.Unlock()
-					continue
+					continue mainSchedLoop
 				}
 
 				it := iti.(item)
@@ -191,16 +199,19 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 						s.onErr(context.Background(), it.id, prom.ID(), time.Unix(it.next, 0), err)
 						return
 					}
+					fmt.Println("here 0 3")
 					s.Lock()
 					s.running.Delete(runningItem{cancel: prom.Cancel, runID: ID(prom.ID()), taskID: ID(it.id)})
 					s.Unlock()
 
 					s.sm.finishExecution(it.id, prom.Error() == nil, backend.RunStarted, time.Since(time.Unix(it.next, 0)))
+					fmt.Println("here 0 4")
 
 					if err = prom.Error(); err != nil {
 						s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
 						return
 					}
+					fmt.Println("here 0 5")
 				}(it, prom)
 			}
 		}
@@ -212,13 +223,53 @@ func (s *TreeScheduler) Stop() {
 	s.RLock()
 	semaCap := cap(s.sema)
 	s.RUnlock()
-	s.done <- struct{}{}
-
+	select {
+	case s.done <- struct{}{}:
+	default:
+	}
 	// this is to make sure the semaphore is closed.  It tries to pull cap+1 empty structs from the semaphore, only possible when closed
 	for i := 0; i <= semaCap; i++ {
 		<-s.sema
 	}
 	s.wg.Wait()
+}
+
+func (s *TreeScheduler) descend(ts time.Time) btree.ItemIterator {
+	t := ts.Unix()
+	return func(it btree.Item) bool {
+		x := it.(item)
+		if x.next > t {
+			return false
+		}
+		s.sema <- struct{}{}
+		go func(it item, prom Promise) {
+			fmt.Println("here 4")
+			defer func() {
+				s.wg.Done()
+				<-s.sema
+			}()
+			<-prom.Done()
+			err := prom.Error()
+			if err != nil {
+				s.onErr(context.Background(), it.id, prom.ID(), time.Unix(it.next, 0), err)
+				return
+			}
+			fmt.Println("here 0 3")
+			s.Lock()
+			s.running.Delete(runningItem{cancel: prom.Cancel, runID: ID(prom.ID()), taskID: ID(it.id)})
+			s.Unlock()
+
+			s.sm.finishExecution(it.id, prom.Error() == nil, backend.RunStarted, time.Since(time.Unix(it.next, 0)))
+			fmt.Println("here 0 4")
+
+			if err = prom.Error(); err != nil {
+				s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
+				return
+			}
+			fmt.Println("here 0 5")
+		}(x, prom)
+
+	}
 }
 
 // When gives us the next time the scheduler will run a task.
@@ -276,8 +327,11 @@ func (s *TreeScheduler) Schedule(id ID, cronString string, offset time.Duration,
 		fmt.Println("thing done")
 		s.when = nt
 		if !s.timer.Stop() {
+			fmt.Println("thing done q1")
 			<-s.timer.C()
 		}
+		fmt.Println("thing done q")
+
 		s.timer.Reset(time.Until(s.when))
 	}
 	nextTime, ok := s.nextTime[id]
@@ -307,10 +361,17 @@ func (s *TreeScheduler) Runs(taskID ID, limit int) []ID {
 	return acc
 }
 
+var maxItem = item{
+	next:  math.MaxInt64,
+	nonce: int(^uint(0) >> 1),
+	id:    maxID,
+}
+
 // Item is a task in the scheduler.
 type item struct {
 	cron   cron.Parsed
 	next   int64
+	last   int64
 	nonce  int // for retries
 	offset int
 	id     ID
@@ -320,4 +381,13 @@ type item struct {
 func (it item) Less(bItem btree.Item) bool {
 	it2 := bItem.(item)
 	return it.next < it2.next || (it.next == it2.next && (it.nonce < it2.nonce || it.nonce == it2.nonce && it.id < it2.id))
+}
+
+func (it *item) updateNext() error {
+	newNext, err := it.cron.Next(time.Unix(it.last, 0))
+	if err != nil {
+		return err
+	}
+	it.last = it.next
+	it.next = newNext
 }
