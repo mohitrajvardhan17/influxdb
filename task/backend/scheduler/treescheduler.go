@@ -150,69 +150,20 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 				close(s.sema)
 				fmt.Println("here 1")
 				return
-			case <-s.timer.C():
-				fmt.Println("here 2 fired")
-				iti := s.scheduled.DeleteMin()
-				fmt.Println("here 3")
-				if iti == nil {
-					s.Lock()
-					//if !s.timer.Stop() {
-					//	<-s.timer.C()
-					//}
-					s.timer.Reset(maxWaitTime)
-					s.Unlock()
-					continue mainSchedLoop
-				}
-
-				it := iti.(item)
-				s.sm.startExecution(it.id, time.Since(time.Unix(it.next, 0)))
-				prom, err := s.executor(context.Background(), it.id, time.Unix(it.next, 0))
-				if err != nil {
-					s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
-				}
-				t, err := it.cron.Next(s.time.Unix(it.next, 0))
-				it.next = t.Unix()
-				// we need to return the item to the scheduled before calling s.onErr
-				if err != nil {
-					it.nonce++
-					s.onErr(context.TODO(), it.id, prom.ID(), time.Unix(it.next, 0), err)
-				}
-				s.scheduled.ReplaceOrInsert(it)
-				if prom == nil {
-					break
-				}
-				s.Lock()
-				s.running.ReplaceOrInsert(runningItem{cancel: prom.Cancel, runID: prom.ID(), taskID: ID(it.id)})
-				s.Unlock()
-
-				s.wg.Add(1)
-				s.sema <- struct{}{}
-				go func(it item, prom Promise) {
-					fmt.Println("here 4")
-					defer func() {
-						s.wg.Done()
-						<-s.sema
-					}()
-					<-prom.Done()
-					err := prom.Error()
-					if err != nil {
-						s.onErr(context.Background(), it.id, prom.ID(), time.Unix(it.next, 0), err)
-						return
-					}
-					fmt.Println("here 0 3")
-					s.Lock()
-					s.running.Delete(runningItem{cancel: prom.Cancel, runID: ID(prom.ID()), taskID: ID(it.id)})
-					s.Unlock()
-
-					s.sm.finishExecution(it.id, prom.Error() == nil, backend.RunStarted, time.Since(time.Unix(it.next, 0)))
-					fmt.Println("here 0 4")
-
-					if err = prom.Error(); err != nil {
-						s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
-						return
-					}
-					fmt.Println("here 0 5")
-				}(it, prom)
+			case ts := <-s.timer.C():
+				//fmt.Println("here 2 fired")
+				//iti := s.scheduled.DeleteMin()
+				//fmt.Println("here 3")
+				//if iti == nil {
+				//	s.Lock()
+				//	//if !s.timer.Stop() {
+				//	//	<-s.timer.C()
+				//	//}
+				//	s.timer.Reset(maxWaitTime)
+				//	s.Unlock()
+				//	continue mainSchedLoop
+				//}
+				s.scheduled.Descend(s.descendIterator(ts))
 			}
 		}
 	}()
@@ -234,13 +185,34 @@ func (s *TreeScheduler) Stop() {
 	s.wg.Wait()
 }
 
-func (s *TreeScheduler) descend(ts time.Time) btree.ItemIterator {
+// descendIterator is the btree.ItemIterator that actually calls the executor.
+func (s *TreeScheduler) descendIterator(ts time.Time) btree.ItemIterator {
 	t := ts.Unix()
-	return func(it btree.Item) bool {
-		x := it.(item)
-		if x.next > t {
+	return func(iti btree.Item) bool {
+		it := iti.(item) // its unrecoverable if somehow non-items got into the tree, so we panic here.
+		if it.next > t {
 			return false
 		}
+		s.sm.startExecution(it.id, time.Since(time.Unix(it.next, 0)))
+		prom, err := s.executor(context.Background(), it.id, time.Unix(it.next, 0))
+		if err != nil {
+			s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
+		}
+		t, err := it.cron.Next(s.time.Unix(it.next, 0))
+		it.next = t.Unix()
+		// we need to return the item to the scheduled before calling s.onErr
+		if err != nil {
+			it.nonce++
+			s.onErr(context.TODO(), it.id, prom.ID(), time.Unix(it.next, 0), err)
+		}
+		s.scheduled.ReplaceOrInsert(it)
+		if prom == nil {
+			return true
+		}
+		s.Lock()
+		s.running.ReplaceOrInsert(runningItem{cancel: prom.Cancel, runID: prom.ID(), taskID: ID(it.id)})
+		s.Unlock()
+
 		s.sema <- struct{}{}
 		go func(it item, prom Promise) {
 			fmt.Println("here 4")
@@ -267,8 +239,8 @@ func (s *TreeScheduler) descend(ts time.Time) btree.ItemIterator {
 				return
 			}
 			fmt.Println("here 0 5")
-		}(x, prom)
-
+		}(it, prom)
+		return true
 	}
 }
 
@@ -389,5 +361,6 @@ func (it *item) updateNext() error {
 		return err
 	}
 	it.last = it.next
-	it.next = newNext
+	it.next = newNext.Unix()
+	return nil
 }

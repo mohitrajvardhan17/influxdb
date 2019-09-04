@@ -1,7 +1,6 @@
 package scheduler
 
 import (
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -89,83 +88,20 @@ func (t MockTime) Until(ts time.Time) time.Duration {
 	return t.T.Sub(ts)
 }
 
-// NewTimer returns a timer that will fire after d time.Duration from the underlying time in the MockTime.  It doesn't
-// actually fire after a duration, but fires when you Set the MockTime used to create it, to a time greater than or
-// equal to the underlying MockTime when it was created plus duration d.
-func (t *MockTime) NewTimer(d time.Duration) Timer {
-	t.RLock()
-	defer t.RUnlock()
-	timer := &MockTimer{
-		T:        t,
-		fireTime: t.T.Add(d),
-		stopch:   make(chan struct{}, 1),
-		c:        make(chan time.Time, 1),
-	}
-	go timer.start(d)
-	return timer
-}
-
-func (t *MockTimer) start(ts time.Duration) {
-	t.T.Lock()
-	t.active = true
-	t.T.Unlock()
-	for {
-		t.T.Cond.L.Lock()
-		for t.T.Get().Before(t.fireTime) {
-			t.T.Wait()
-		}
-		select {
-		case t.c <- t.fireTime:
-			log.Println("firing")
-			t.T.Lock()
-			t.active = false
-			t.T.Unlock()
-		case <-t.stopch:
-			log.Println("stopping")
-			t.T.Cond.L.Unlock()
-			return
-		default:
-		}
-		t.T.Cond.L.Unlock()
-
-	}
-	//for {t.T.Cond.
-	//	t.T.Cond.Wait()
-	//	t.T.RLock()
-	//	ts := t.T.T
-	//	ft := t.fireTime
-	//	t.T.RUnlock()
-	//	select {
-	//	case <-t.stopch:
-	//		t.T.Lock()
-	//		t.fireTime = time.Time{}
-	//		t.T.Unlock()
-	//	default:
-	//	}
-	//	if (!ft.IsZero()) && !ft.After(ts) {
-	//		select {
-	//		case t.c <- ft:
-	//		default:
-	//		}
-	//		t.T.Lock()
-	//		t.fireTime = time.Time{}
-	//		t.T.Unlock()
-	//	}
-	//}
-}
-
-// Set sets the underlying time to ts.  It is used when mocking time out.  It is threadsafe.
 func (t *MockTime) Set(ts time.Time) {
-	t.Lock()
+	t.Cond.L.Lock()
 	t.T = ts
+	log.Println("setting", ts)
 	t.Cond.Broadcast()
-	t.Unlock()
+	log.Println("setted", ts)
+	t.Cond.L.Unlock()
+	log.Println("done setting", ts)
+
 }
 
-// Get gets the underlying time in a threadsafe way.
 func (t *MockTime) Get() time.Time {
-	t.RLock()
-	defer t.RUnlock()
+	t.Cond.L.Lock()
+	defer t.Cond.L.Unlock()
 	return t.T
 }
 
@@ -176,53 +112,306 @@ type MockTimer struct {
 	c        chan time.Time
 	stopch   chan struct{}
 	active   bool
+	lock     sync.RWMutex
+	wg       sync.WaitGroup
+	starting sync.WaitGroup
 }
 
-// C returns a <chan time.Time, it is analogous to time.Timer.C.
+// NewTimer returns a timer that will fire after d time.Duration from the underlying time in the MockTime.  It doesn't
+// actually fire after a duration, but fires when you Set the MockTime used to create it, to a time greater than or
+// equal to the underlying MockTime when it was created plus duration d.
+func (t *MockTime) NewTimer(d time.Duration) Timer {
+	t.Cond.L.Lock()
+	timer := &MockTimer{
+		T:        t,
+		fireTime: t.T.Add(d),
+		stopch:   make(chan struct{}, 1),
+		c:        make(chan time.Time, 1),
+	}
+	timer.start(d)
+	t.Cond.L.Unlock()
+	return timer
+}
+
 func (t *MockTimer) C() <-chan time.Time {
 	return t.c
 }
 
-// Reset changes the timer to expire after duration d. It returns true if the timer had been active, false if the timer had expired or been stopped.
 func (t *MockTimer) Reset(d time.Duration) bool {
-	t.T.Lock()
-	defer t.T.Unlock()
-	t.fireTime = t.fireTime.Add(d)
-	if !t.active {
-		t.stopch = make(chan struct{}, 1)
-		t.active = true
-		go t.start(d)
-		return false
-	}
-	fmt.Println("here 99")
-	//t.T.Cond.Broadcast()
+	t.starting.Wait()
+	log.Println("resetting")
+	t.T.Cond.L.Lock()
+	// clear the channels
+	{
+		log.Println("clearing chans")
 
-	log.Println("here here 7")
-	return t.active
+		select {
+		case <-t.stopch:
+		default:
+		}
+		select {
+		case <-t.c:
+		default:
+		}
+	}
+	defer t.T.Cond.L.Unlock()
+	t.fireTime = t.fireTime.Add(d)
+	t.start(d)
+	t.T.Cond.Broadcast()
+	return false
+
 }
 
-// Stop prevents the Timer from firing. It returns true if the call stops the timer, false if the timer has already
-// expired or been stopped. Stop does not close the channel, to prevent a read from the channel succeeding incorrectly.
-//
-// To prevent a timer created with NewTimer from firing after a call to Stop, check the return value and drain the
-// channel. For example, assuming the program has not received from t.C already:
-//	if !t.Stop() {
-//		<-t.C
-//	}
-//	t.Reset(d)
+func (t *MockTimer) Stop() (active bool) {
+	t.starting.Wait()
+	log.Println("stopping 0 1")
+	t.T.Cond.L.Lock()
+	defer func() {
+		log.Println("starting waiting")
+		log.Println("broadcasting stop")
+		t.T.Cond.Broadcast()
+		t.T.Cond.L.Unlock()
+		log.Println("in the actual wait waiting")
+		t.wg.Wait()
+		log.Println("finished waiting")
+	}()
+	log.Println("stopping 0 2")
+	if !t.active {
+		log.Println("exiting early")
+		select {
+		case t.c <- t.fireTime:
+		default:
 
-// This should not be done concurrent to other receives from the Timer's channel.
-func (t *MockTimer) Stop() bool {
-	t.T.RLock()
-	defer t.T.RUnlock()
-	if t.active {
+		}
 		return false
 	}
 	select {
 	case t.stopch <- struct{}{}:
-		t.active = false
-		return true
+		log.Println("stopping 0")
 	default:
-		return false
+		log.Println("stopping 0 3")
 	}
+	if !t.active {
+		select {
+		case t.c <- t.fireTime:
+		default:
+		}
+	}
+	return t.active
 }
+
+func (t *MockTimer) start(ts time.Duration) {
+	log.Println("starting timer")
+	t.wg.Add(1)
+	t.starting.Add(1)
+	go func() {
+		defer func() {
+			log.Println("About to unlock")
+			t.active = false
+
+			t.T.Cond.L.Unlock()
+			log.Println("About to done")
+			t.wg.Done()
+			log.Println("stopping! 1")
+		}()
+		for {
+			log.Println("in loop")
+			t.T.Cond.L.Lock()
+			t.active = true   // this needs to be after we tale the lock, but before we exit the starting state
+			t.starting.Done() // this needs to be after we take the lock on start, to ensure this goroutine starts before we stop or reset
+			log.Println("0")
+			//check it should already be fired/stopped
+			if !t.T.T.Before(t.fireTime) {
+				log.Println("in early check")
+				select {
+				case t.c <- t.fireTime:
+					return
+				case <-t.stopch:
+					return
+				default:
+				}
+			}
+			log.Println("1 in cond wait")
+			t.T.Cond.Wait()
+			log.Println("2 exit cond wait")
+			select {
+			case <-t.stopch:
+				return
+			default:
+			}
+			log.Println("about to check")
+			// check it needs to be be fired/stopped
+
+			if !t.T.T.Before(t.fireTime) {
+				select {
+				case t.c <- t.fireTime:
+					return
+				case <-t.stopch:
+					return
+				}
+			}
+			select {
+			case <-t.stopch:
+				return
+			default:
+			}
+			log.Println("wait? what?")
+			t.T.Cond.L.Unlock()
+		}
+	}()
+}
+
+//
+//func (t *MockTimer) start(ts time.Duration) {
+//	t.wg.Add(1)
+//	t.active = true // we have to do this before the goroutine to prevent a logical datarace
+//	go func() {
+//		i := 0
+//		defer t.wg.Done()
+//		defer fmt.Println("end", i)
+//		for {
+//			log.Println("stopping 3")
+//			fmt.Println(i)
+//			// t.T.Cond.L.Lock()
+//			log.Println("stopping 4")
+//
+//			//for t.T.T.Before(t.fireTime) {
+//			//	log.Println("stopping 5")
+//			//
+//			select {
+//			case <-t.stopch:
+//				log.Println("stopping now")
+//				return
+//			default:
+//			}
+//			//fmt.Println("syn", i)
+//			t.T.Cond.L.Lock()
+//			t.T.Wait()
+//			t.T.Cond.L.Unlock()
+//			//fmt.Println("ack", i)
+//
+//			//}
+//			log.Println("stopping 6")
+//			select {
+//			case t.c <- t.Time():
+//				//log.Println("firing")
+//				t.T.Lock()
+//				t.active = false
+//				t.T.Unlock()
+//			case <-t.stopch:
+//				//log.Println("stopping 2")
+//				select {
+//				case t.c <- t.Time():
+//					fmt.Println("crap here")
+//				default:
+//				}
+//				t.T.Cond.L.Unlock()
+//				return
+//			default:
+//			}
+//			//t.T.Cond.L.Unlock()
+//			i++
+//		}
+//	}()
+//}
+//
+//// Set sets the underlying time to ts.  It is used when mocking time out.  It is threadsafe.
+//func (t *MockTime) Set(ts time.Time) {
+//	t.Lock()
+//	t.T = ts
+//	t.Cond.Broadcast()
+//	t.Unlock()
+//}
+//
+//// Get gets the underlying time in a threadsafe way.
+//func (t *MockTime) Get() time.Time {
+//	t.RLock()
+//	defer t.RUnlock()
+//	return t.T
+//}
+//
+//
+//// C returns a <chan time.Time, it is analogous to time.Timer.C.
+//func (t *MockTimer) C() <-chan time.Time {
+//	return t.c
+//}
+//
+//func (t *MockTimer) Time() time.Time {
+//	t.lock.RLock()
+//	defer t.lock.RUnlock()
+//	return t.fireTime
+//}
+//
+//// Reset changes the timer to expire after duration d. It returns true if the timer had been active, false if the timer had expired or been stopped.
+//func (t *MockTimer) Reset(d time.Duration) bool {
+//	t.T.Lock()
+//	defer t.T.Unlock()
+//	t.lock.Lock()
+//	defer t.lock.Unlock()
+//	return t.reset(d)
+//}
+//
+//func (t *MockTimer) reset(d time.Duration) bool {
+//	t.fireTime = t.fireTime.Add(d)
+//	// clear the channel if there is something in it
+//	{
+//		select {
+//		case <-t.stopch:
+//		default:
+//		}
+//		select {
+//		case <-t.c:
+//		default:
+//		}
+//	}
+//	defer func() {
+//		t.T.L.Lock()
+//		t.T.Cond.Broadcast()
+//		t.T.L.Unlock()
+//	}()
+//	if !t.active {
+//		t.start(d)
+//		return false
+//	}
+//	return t.active
+//}
+//
+//// Stop prevents the Timer from firing. It returns true if the call stops the timer, false if the timer has already
+//// expired or been stopped. Stop does not close the channel, to prevent a read from the channel succeeding incorrectly.
+////
+//// To prevent a timer created with NewTimer from firing after a call to Stop, check the return value and drain the
+//// channel. For example, assuming the program has not received from t.C already:
+////	if !t.Stop() {
+////		<-t.C
+////	}
+////	t.Reset(d)
+//
+//// This should not be done concurrent to other receives from the Timer's channel.
+//func (t *MockTimer) Stop() bool {
+//	t.T.Lock()
+//	defer t.T.Unlock()
+//	if !t.active {
+//		return false
+//	}
+//	//select {
+//	//case <-t.c:
+//	//default:
+//	//}
+//	select {
+//	case t.stopch <- struct{}{}:
+//		log.Println("kek 0")
+//
+//		t.active = false
+//		//t.T.Lock()
+//		log.Println("kek 3")
+//		//t.T.Cond.Broadcast()
+//		log.Println("kek 4")
+//		//t.T.Unlock()
+//		log.Println("kek 1")
+//		t.wg.Wait()
+//		log.Println("kek 2")
+//		return true
+//	default:
+//		return false
+//	}
+//}
