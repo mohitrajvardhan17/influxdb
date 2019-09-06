@@ -30,7 +30,7 @@ require (
 	github.com/golang/gddo v0.0.0-20181116215533-9bd4a3295021
 	github.com/golang/protobuf v1.3.1
 	github.com/golang/snappy v0.0.1
-	github.com/google/btree v0.0.0-20180813153112-4030bb1f1f0c
+	github.com/google/btree v1.0.1-0.20190326150332-20236160a414
 	github.com/google/go-cmp v0.3.0
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/gopherjs/gopherjs v0.0.0-20181103185306-d547d1d9531e // indirect
@@ -41,6 +41,7 @@ require (
 	github.com/influxdata/cron v0.0.0-20190812233253-38faece03642
 	github.com/influxdata/flux v0.38.0
 	github.com/influxdata/influxql v0.0.0-20180925231337-1cbfca8e56b6
+	github.com/influxdata/kapacitor v1.5.3
 	github.com/influxdata/usage-client v0.0.0-20160829180054-6d3895376368
 	github.com/jessevdk/go-flags v1.4.0
 	github.com/jsternberg/zap-logfmt v1.2.0

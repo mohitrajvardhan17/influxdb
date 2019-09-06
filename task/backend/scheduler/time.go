@@ -1,7 +1,6 @@
 package scheduler
 
 import (
-	"log"
 	"sync"
 	"time"
 )
@@ -91,11 +90,8 @@ func (t MockTime) Until(ts time.Time) time.Duration {
 func (t *MockTime) Set(ts time.Time) {
 	t.Cond.L.Lock()
 	t.T = ts
-	log.Println("setting", ts)
 	t.Cond.Broadcast()
-	log.Println("setted", ts)
 	t.Cond.L.Unlock()
-	log.Println("done setting", ts)
 
 }
 
@@ -139,12 +135,9 @@ func (t *MockTimer) C() <-chan time.Time {
 
 func (t *MockTimer) Reset(d time.Duration) bool {
 	t.starting.Wait()
-	log.Println("resetting")
 	t.T.Cond.L.Lock()
 	// clear the channels
 	{
-		log.Println("clearing chans")
-
 		select {
 		case <-t.stopch:
 		default:
@@ -155,7 +148,7 @@ func (t *MockTimer) Reset(d time.Duration) bool {
 		}
 	}
 	defer t.T.Cond.L.Unlock()
-	t.fireTime = t.fireTime.Add(d)
+	t.fireTime = t.T.Now().Add(d)
 	t.start(d)
 	t.T.Cond.Broadcast()
 	return false
@@ -164,20 +157,13 @@ func (t *MockTimer) Reset(d time.Duration) bool {
 
 func (t *MockTimer) Stop() (active bool) {
 	t.starting.Wait()
-	log.Println("stopping 0 1")
 	t.T.Cond.L.Lock()
 	defer func() {
-		log.Println("starting waiting")
-		log.Println("broadcasting stop")
 		t.T.Cond.Broadcast()
 		t.T.Cond.L.Unlock()
-		log.Println("in the actual wait waiting")
 		t.wg.Wait()
-		log.Println("finished waiting")
 	}()
-	log.Println("stopping 0 2")
 	if !t.active {
-		log.Println("exiting early")
 		select {
 		case t.c <- t.fireTime:
 		default:
@@ -187,9 +173,7 @@ func (t *MockTimer) Stop() (active bool) {
 	}
 	select {
 	case t.stopch <- struct{}{}:
-		log.Println("stopping 0")
 	default:
-		log.Println("stopping 0 3")
 	}
 	if !t.active {
 		select {
@@ -201,28 +185,22 @@ func (t *MockTimer) Stop() (active bool) {
 }
 
 func (t *MockTimer) start(ts time.Duration) {
-	log.Println("starting timer")
 	t.wg.Add(1)
 	t.starting.Add(1)
 	go func() {
 		defer func() {
-			log.Println("About to unlock")
 			t.active = false
-
 			t.T.Cond.L.Unlock()
-			log.Println("About to done")
 			t.wg.Done()
-			log.Println("stopping! 1")
 		}()
 		for {
-			log.Println("in loop")
 			t.T.Cond.L.Lock()
-			t.active = true   // this needs to be after we tale the lock, but before we exit the starting state
-			t.starting.Done() // this needs to be after we take the lock on start, to ensure this goroutine starts before we stop or reset
-			log.Println("0")
+			if !t.active {
+				t.active = true   // this needs to be after we tale the lock, but before we exit the starting state
+				t.starting.Done() // this needs to be after we take the lock on start, to ensure this goroutine starts before we stop or reset
+			}
 			//check it should already be fired/stopped
 			if !t.T.T.Before(t.fireTime) {
-				log.Println("in early check")
 				select {
 				case t.c <- t.fireTime:
 					return
@@ -231,15 +209,12 @@ func (t *MockTimer) start(ts time.Duration) {
 				default:
 				}
 			}
-			log.Println("1 in cond wait")
 			t.T.Cond.Wait()
-			log.Println("2 exit cond wait")
 			select {
 			case <-t.stopch:
 				return
 			default:
 			}
-			log.Println("about to check")
 			// check it needs to be be fired/stopped
 
 			if !t.T.T.Before(t.fireTime) {
@@ -255,7 +230,6 @@ func (t *MockTimer) start(ts time.Duration) {
 				return
 			default:
 			}
-			log.Println("wait? what?")
 			t.T.Cond.L.Unlock()
 		}
 	}()

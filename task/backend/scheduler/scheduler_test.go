@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -13,28 +14,73 @@ import (
 
 type mockExecutor struct {
 	sync.Mutex
-	fn func(l *sync.Mutex, ctx context.Context, id scheduler.ID, scheduledAt time.Time)
+	fn  func(l *sync.Mutex, ctx context.Context, id scheduler.ID, scheduledAt time.Time)
+	Err error
 }
 
 func (e *mockExecutor) Execute(ctx context.Context, id scheduler.ID, scheduledAt time.Time) (scheduler.Promise, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{}, 1)
 	select {
 	case <-ctx.Done():
+	default:
+		go func() {
+			e.fn(&sync.Mutex{}, ctx, id, scheduledAt)
+			done <- struct{}{}
+		}()
+
 	}
-	return nil, nil
+
+	return &MockPromise{
+		id:     scheduler.ID(rand.Int63()),
+		cancel: cancel,
+		done:   done,
+		err:    e.Err,
+	}, nil
+}
+
+type MockPromise struct {
+	id     scheduler.ID
+	cancel context.CancelFunc
+	done   <-chan struct{}
+	err    error
+}
+
+func (p *MockPromise) ID() scheduler.ID {
+	return p.id
+}
+
+// Cancel a promise, identical to calling executor.Cancel().
+func (p *MockPromise) Cancel(_ context.Context) {
+	p.cancel()
+}
+
+// Done returns a read only channel that when closed indicates the execution is complete.
+func (p *MockPromise) Done() <-chan struct{} {
+	return p.done
+}
+
+// Error returns an error only when the execution is complete.
+// This is a hanging call until Done() is closed.
+func (p *MockPromise) Error() error {
+	return p.err
 }
 
 func TestSchedule_Next(t *testing.T) {
-	now := time.Now().Add(-20 * time.Second)
+	now := time.Now()
 	c := make(chan time.Time, 10)
 	exe := mockExecutor{fn: func(l *sync.Mutex, ctx context.Context, id scheduler.ID, scheduledAt time.Time) {
 		l.Lock()
+		defer l.Unlock()
+		log.Println("executing the executor")
 		select {
 		case <-ctx.Done():
+			t.Log("ctx done")
 		case c <- scheduledAt:
+			t.Log("adding to queue")
 		default:
 			t.Errorf("called the executor too many times")
 		}
-		defer l.Unlock()
 	}}
 	log.Println("here now 2")
 	mockTime := scheduler.NewMockTime(now)
@@ -43,36 +89,32 @@ func TestSchedule_Next(t *testing.T) {
 		t.Fatal(err)
 	}
 	//defer sch.Stop()
-	err = sch.Schedule(1, "* * * * * * *", 10*time.Second, now.Add(20*time.Second))
+	err = sch.Schedule(1, "* * * * * * *", time.Second, now.Add(-20*time.Second))
+	log.Println("6666666")
 	if err != nil {
 		t.Fatal(err)
 	}
-	log.Println("here now 3", mockTime.Get())
+	it := sch.Tree().Clone().Min().(scheduler.Item)
+	log.Println("777777777")
 
-	mockTime.Set(now.Add(1000 * time.Second))
-	fmt.Println("here now 44 ")
+	t.Log(sch.Runs(1, 90), it.ID, it.Offset)
+	log.Println("8888888")
+	t.Log("here now 3", mockTime.Get())
+	log.Println("55555555")
 
-	for i := 0; i < 10; i++ {
-		fmt.Println("here now 4 ", i)
-
-		select {
-		case ts := <-c:
-			fmt.Println("here now 7 ", i)
-
-			if i == 0 && ts != now.Add(20*time.Second) {
-				t.Fatal("Returned incorrect starting time")
-			}
-			if !ts.Equal(now.Add(time.Duration(i) * time.Second)) {
-				t.Fatalf("Returned incorrect time for run #%d", i)
-			}
-			log.Println("here now 5 ", i)
-		case <-time.After(3 * time.Second): // a timeout for the test
-			t.Fatalf("test timed out early after %d iterations", i+1)
-			return
-		}
-		fmt.Println("here now 6 ", i)
+	go func() {
+		time.Sleep(time.Millisecond)
+		mockTime.Set(now.Add(4000 * time.Second))
+		fmt.Println("here now 5")
+	}()
+	fmt.Println("here now 4", mockTime.Get())
+	select {
+	case <-c:
+		t.Log("**************************** woot ************************")
+	case <-time.After(5 * time.Second):
+		t.Fatal("test timed out", sch.Now().Unix(), sch.When().Unix())
 	}
-	log.Println("*********************8here now 1")
+	fmt.Println("99999999")
 }
 
 func TestTreeScheduler_Stop(t *testing.T) {

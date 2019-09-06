@@ -24,7 +24,7 @@ func TestStdTime_Unix(t *testing.T) {
 }
 
 func TestMockTimer(t *testing.T) {
-	timeForComparison := time.Date(2016, 2, 3, 4, 5, 6, 7, time.UTC)
+	timeForComparison := time.Now() //time.Date(2016, 2, 3, 4, 5, 6, 7, time.UTC)
 	mt := NewMockTime(timeForComparison)
 	timer := mt.NewTimer(10 * time.Second)
 	select {
@@ -60,9 +60,17 @@ func TestMockTimer(t *testing.T) {
 	case ts := <-timer2.C():
 		t.Errorf("expected timer to NOT fire if time was not up, but it did at ts: %s", ts)
 	case <-time.After(time.Second):
-	default:
 	}
 
+	if !timer2.Stop() {
+		<-timer2.C()
+	}
+	timer2.Reset(0)
+	select {
+	case <-time.After(time.Second):
+		t.Error("expected timer to fire when it was reset to 0, but it didn't")
+	case <-timer2.C():
+	}
 }
 
 func TestMockTimer_Stop(t *testing.T) {

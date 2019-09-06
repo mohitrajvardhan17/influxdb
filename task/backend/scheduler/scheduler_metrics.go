@@ -58,7 +58,7 @@ func NewSchedulerMetrics(te *TreeScheduler) *SchedulerMetrics {
 			Namespace:  namespace,
 			Subsystem:  subsystem,
 			Name:       "schedule_delay",
-			Help:       "The duration between when a item should be scheduled and when it is told to execute.",
+			Help:       "The duration between when a Item should be scheduled and when it is told to execute.",
 			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 		}),
 

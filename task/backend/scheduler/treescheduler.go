@@ -47,9 +47,14 @@ type TreeScheduler struct {
 	timer     Timer
 	done      chan struct{}
 	sema      chan struct{}
+	active    bool
 	wg        sync.WaitGroup
 
 	sm *SchedulerMetrics
+}
+
+func (s *TreeScheduler) Tree() *btree.BTree {
+	return s.scheduled
 }
 
 // clearTask is a method for deleting a range of tasks.
@@ -113,6 +118,7 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 		executor:  Executor,
 		scheduled: btree.New(degreeBtreeScheduled),
 		running:   btree.New(degreeBtreeRunning),
+		nextTime:  map[ID]int64{},
 		onErr:     func(_ context.Context, _ ID, _ ID, _ time.Time, _ error) bool { return true },
 		sema:      make(chan struct{}, defaultMaxRunsOutstanding),
 		time:      stdTime{},
@@ -132,38 +138,61 @@ func NewScheduler(Executor ExecutorFunc, opts ...treeSchedulerOptFunc) (*TreeSch
 	if Executor == nil {
 		return nil, nil, errors.New("Executor must be a non-nil function")
 	}
-
-	log.Println("stopping! q1")
-
+	s.wg.Add(1)
+	log.Println("q1")
 	go func() {
-		log.Println("stopping! q2")
-	mainSchedLoop:
+		defer s.wg.Done()
+		log.Println("q2")
+		//s.scheduled.Descend(s.descendIterator(time.Time{}))
+	schedulerLoop:
 		for {
-			fmt.Println("here 0", s.when)
+			s.Lock()
+			min := s.scheduled.Min()
+			if min == nil {
+				if !s.timer.Stop() {
+					<-s.timer.C()
+				}
+				s.when = s.time.Now().Add(maxWaitTime)
+				s.timer.Reset(maxWaitTime)
+			}
+			//for i := 0; i < 10; i++ {
+			//	time.Sleep(100 * time.Millisecond)
+			//	//log.Println("before select", s.when, s.time.Now(), min.(Item).next, s.timer.(*MockTimer).fireTime.Unix(), s.timer.(*MockTimer).Reset(0))
+			//}
+			s.Unlock()
 			select {
 			case <-s.done:
-				fmt.Println("here 12")
 				s.Lock()
+				log.Println("closing tree")
 				s.timer.Stop()
-				fmt.Println("here 11")
-				s.Unlock()
 				close(s.sema)
-				fmt.Println("here 1")
+				s.Unlock()
 				return
 			case ts := <-s.timer.C():
-				//fmt.Println("here 2 fired")
-				//iti := s.scheduled.DeleteMin()
-				//fmt.Println("here 3")
-				//if iti == nil {
-				//	s.Lock()
-				//	//if !s.timer.Stop() {
-				//	//	<-s.timer.C()
-				//	//}
-				//	s.timer.Reset(maxWaitTime)
-				//	s.Unlock()
-				//	continue mainSchedLoop
-				//}
-				s.scheduled.Descend(s.descendIterator(ts))
+				s.Lock()
+				log.Println("timer fired")
+
+				min := s.scheduled.Min() // grab a new item, because there could be a different item at the top of the queue
+				if min == nil {
+					if !s.timer.Stop() {
+						<-s.timer.C()
+					}
+					log.Println("setting timer to maxtime")
+					s.when = s.time.Now().Add(maxWaitTime)
+					s.timer.Reset(maxWaitTime)
+					s.Unlock()
+					continue schedulerLoop
+				}
+				minItem := min.(Item) // we want it to panic if things other than Items are populating the scheduler, as it is something we can't recover from.
+				s.timer.Reset(s.time.Until(time.Unix(minItem.next, 0)))
+				s.Unlock()
+				for s.process(ts) {
+					select {
+					case <-s.done:
+						close(s.sema)
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -185,63 +214,103 @@ func (s *TreeScheduler) Stop() {
 	s.wg.Wait()
 }
 
-// descendIterator is the btree.ItemIterator that actually calls the executor.
-func (s *TreeScheduler) descendIterator(ts time.Time) btree.ItemIterator {
-	t := ts.Unix()
-	return func(iti btree.Item) bool {
-		it := iti.(item) // its unrecoverable if somehow non-items got into the tree, so we panic here.
-		if it.next > t {
-			return false
-		}
-		s.sm.startExecution(it.id, time.Since(time.Unix(it.next, 0)))
-		prom, err := s.executor(context.Background(), it.id, time.Unix(it.next, 0))
-		if err != nil {
-			s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
-		}
-		t, err := it.cron.Next(s.time.Unix(it.next, 0))
-		it.next = t.Unix()
-		// we need to return the item to the scheduled before calling s.onErr
-		if err != nil {
-			it.nonce++
-			s.onErr(context.TODO(), it.id, prom.ID(), time.Unix(it.next, 0), err)
-		}
-		s.scheduled.ReplaceOrInsert(it)
-		if prom == nil {
-			return true
-		}
+// process processes the next item in the tree if it is before on on time ts.
+func (s *TreeScheduler) process(ts time.Time) bool {
+	log.Println("processing")
+	s.Lock()
+	min := s.scheduled.DeleteMin() // so other threads won't grab it
+	s.Unlock()
+	if min == nil {
+		log.Println("processing min==nil")
+
+		return false
+	}
+	it := min.(Item) // we want it to panic if things other than Items are populating the scheduler, as it is something we can't recover from.
+	defer func() {
 		s.Lock()
-		s.running.ReplaceOrInsert(runningItem{cancel: prom.Cancel, runID: prom.ID(), taskID: ID(it.id)})
+		s.scheduled.ReplaceOrInsert(it)
+		s.nextTime[it.ID] = it.next
 		s.Unlock()
+	}() // cleanup
 
-		s.sema <- struct{}{}
-		go func(it item, prom Promise) {
-			fmt.Println("here 4")
-			defer func() {
-				s.wg.Done()
-				<-s.sema
-			}()
-			<-prom.Done()
-			err := prom.Error()
-			if err != nil {
-				s.onErr(context.Background(), it.id, prom.ID(), time.Unix(it.next, 0), err)
-				return
-			}
-			fmt.Println("here 0 3")
-			s.Lock()
-			s.running.Delete(runningItem{cancel: prom.Cancel, runID: ID(prom.ID()), taskID: ID(it.id)})
-			s.Unlock()
+	if time.Unix(it.next+it.Offset, 0).After(ts) {
+		log.Println("after", time.Unix(it.next+it.Offset, 0), ts)
+		return false
+	}
+	log.Println("survived")
+	// we then do a sem wait, but because if we are waiting too long on the semafor our data might be stale, we need a timeout on this where we go back and grab the next item again, if it is.
+	{
+		semWaitTimeout := time.NewTimer(10 * time.Millisecond)
+		select {
+		case s.sema <- struct{}{}:
+			semWaitTimeout.Stop()
+		case <-semWaitTimeout.C:
+			log.Println("sem wait timeout exceeded")
+			return true // because we want to keep trying if we are in this case
+		}
+	}
+	log.Println("survived 2")
 
-			s.sm.finishExecution(it.id, prom.Error() == nil, backend.RunStarted, time.Since(time.Unix(it.next, 0)))
-			fmt.Println("here 0 4")
+	s.sm.startExecution(it.ID, time.Since(time.Unix(it.next, 0)))
+	prom, err := s.executor(context.Background(), it.ID, time.Unix(it.next, 0))
+	if err != nil {
+		s.onErr(context.Background(), it.ID, 0, time.Unix(it.next, 0), err)
+	}
+	log.Println("survived 3")
 
-			if err = prom.Error(); err != nil {
-				s.onErr(context.Background(), it.id, 0, time.Unix(it.next, 0), err)
-				return
-			}
-			fmt.Println("here 0 5")
-		}(it, prom)
+	//t, err := it.cron.Next(s.time.Unix(it.next, 0))
+	//// if the call to Next fails, then we really can't get a timestamp for the error
+	//if err != nil {
+	//	it.nonce++
+	//	s.onErr(context.TODO(), it.ID, prom.ID(), ts, err)
+	//}
+	//
+	//it.next = t.Unix()
+	if err := it.updateNext(); err != nil {
+		s.onErr(context.TODO(), it.ID, prom.ID(), ts, err)
+	}
+	// we need to return the Item to the scheduled before calling s.onErr
+	if prom == nil {
 		return true
 	}
+	s.Lock()
+	s.running.ReplaceOrInsert(runningItem{cancel: prom.Cancel, runID: prom.ID(), taskID: ID(it.ID)})
+	s.Unlock()
+
+	go func(it Item, prom Promise) {
+		fmt.Println("here 4")
+		defer func() {
+			s.wg.Done()
+			<-s.sema
+		}()
+		<-prom.Done()
+		err := prom.Error()
+		if err != nil {
+			s.onErr(context.Background(), it.ID, prom.ID(), time.Unix(it.next, 0), err)
+			return
+		}
+		fmt.Println("here 0 3")
+		s.Lock()
+		s.running.Delete(runningItem{cancel: prom.Cancel, runID: ID(prom.ID()), taskID: ID(it.ID)})
+		s.Unlock()
+
+		s.sm.finishExecution(it.ID, prom.Error() == nil, backend.RunStarted, time.Since(time.Unix(it.next, 0)))
+		fmt.Println("here 0 4")
+
+		if err = prom.Error(); err != nil {
+			s.onErr(context.Background(), it.ID, 0, time.Unix(it.next, 0), err)
+			return
+		}
+		fmt.Println("here 0 5")
+	}(it, prom)
+	return true
+}
+
+func (s *TreeScheduler) Now() time.Time {
+	s.RLock()
+	now := s.time.Now()
+	s.RUnlock()
+	return now
 }
 
 // When gives us the next time the scheduler will run a task.
@@ -265,10 +334,11 @@ func (s *TreeScheduler) Release(taskID ID) error {
 	}
 
 	// delete the old task run time
-	s.scheduled.Delete(item{
+	s.scheduled.Delete(Item{
 		next: nextTime,
-		id:   taskID,
+		ID:   taskID,
 	})
+	delete(s.nextTime, taskID)
 
 	s.running.AscendGreaterOrEqual(runningItem{taskID: taskID}, s.clearTask(taskID))
 	return nil
@@ -285,16 +355,22 @@ func (s *TreeScheduler) Schedule(id ID, cronString string, offset time.Duration,
 	if err != nil {
 		return err
 	}
-	it := item{
-		cron: crSch,
-		next: nt.Add(offset).Unix(),
-		id:   id,
+	it := Item{
+		cron:   crSch,
+		next:   nt.Unix(),
+		ID:     id,
+		Offset: int64(offset.Seconds()),
+		last:   since.Unix(),
 	}
+
 	fmt.Println("thing done 3")
 
 	s.Lock()
-	defer s.Unlock()
-
+	defer func() {
+		s.Unlock()
+		log.Println("exiting Schedule", it.ID)
+	}()
+	nt = nt.Add(offset)
 	if s.when.After(nt) {
 		fmt.Println("thing done")
 		s.when = nt
@@ -302,22 +378,28 @@ func (s *TreeScheduler) Schedule(id ID, cronString string, offset time.Duration,
 			fmt.Println("thing done q1")
 			<-s.timer.C()
 		}
+		until := s.time.Until(s.when)
+		if until < 0 {
+			s.timer.Reset(0)
+		} else {
+			s.timer.Reset(s.time.Until(s.when))
+		}
 		fmt.Println("thing done q")
 
-		s.timer.Reset(time.Until(s.when))
 	}
 	nextTime, ok := s.nextTime[id]
 	if !ok {
 		fmt.Println("thing done 4")
+		s.nextTime[id] = it.next + it.Offset
 		s.scheduled.ReplaceOrInsert(it)
 		return nil
 	}
 	fmt.Println("thing done 2")
 
 	// delete the old task run time
-	s.scheduled.Delete(item{
+	s.scheduled.Delete(Item{
 		next: nextTime,
-		id:   id,
+		ID:   id,
 	})
 
 	// insert the new task run time
@@ -327,36 +409,42 @@ func (s *TreeScheduler) Schedule(id ID, cronString string, offset time.Duration,
 
 func (s *TreeScheduler) Runs(taskID ID, limit int) []ID {
 	s.RLock()
-	defer s.RUnlock()
+	defer func() {
+		s.RUnlock()
+		fmt.Println("saaaaaaaa")
+	}()
+	fmt.Println("bbbbbbbbb")
+
 	iter, acc := s.runs(taskID, limit)
+	fmt.Println("saaaaaaaa")
 	s.running.AscendGreaterOrEqual(runningItem{taskID: 0}, iter)
 	return acc
 }
 
-var maxItem = item{
+var maxItem = Item{
 	next:  math.MaxInt64,
 	nonce: int(^uint(0) >> 1),
-	id:    maxID,
+	ID:    maxID,
 }
 
 // Item is a task in the scheduler.
-type item struct {
+type Item struct {
 	cron   cron.Parsed
 	next   int64
+	Offset int64
 	last   int64
 	nonce  int // for retries
-	offset int
-	id     ID
+	ID     ID
 }
 
 // Less tells us if one Item is less than another
-func (it item) Less(bItem btree.Item) bool {
-	it2 := bItem.(item)
-	return it.next < it2.next || (it.next == it2.next && (it.nonce < it2.nonce || it.nonce == it2.nonce && it.id < it2.id))
+func (it Item) Less(bItem btree.Item) bool {
+	it2 := bItem.(Item)
+	return it.next < it2.next || (it.next == it2.next && (it.nonce < it2.nonce || it.nonce == it2.nonce && it.ID < it2.ID))
 }
 
-func (it *item) updateNext() error {
-	newNext, err := it.cron.Next(time.Unix(it.last, 0))
+func (it *Item) updateNext() error {
+	newNext, err := it.cron.Next(time.Unix(it.next, 0))
 	if err != nil {
 		return err
 	}

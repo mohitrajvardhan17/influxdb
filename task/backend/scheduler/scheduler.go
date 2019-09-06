@@ -9,7 +9,7 @@ import (
 )
 
 // ID duplicates the influxdb ID so users of the scheduler don't have to
-// import influxdb for the id.
+// import influxdb for the ID.
 // TODO(lh): maybe make this its own thing sometime in the future.
 type ID influxdb.ID
 
@@ -17,7 +17,7 @@ var maxID = ID(int(^uint(0) >> 1))
 
 // Checkpointer allows us to restart a service from the last time we executed.
 type Checkpointer interface {
-	// Checkpoint saves the last checkpoint a id has reached.
+	// Checkpoint saves the last checkpoint a ID has reached.
 	Checkpoint(ctx context.Context, id ID, t time.Time) error
 }
 
