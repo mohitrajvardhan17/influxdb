@@ -104,3 +104,5 @@ replace github.com/Sirupsen/logrus => github.com/sirupsen/logrus v1.2.0
 replace github.com/influxdata/platform => /dev/null
 
 replace github.com/goreleaser/goreleaser => github.com/influxdata/goreleaser v0.97.0-influx
+
+replace github.com/influxdata/flux => ../flux

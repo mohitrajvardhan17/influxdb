@@ -55,8 +55,7 @@ type Controller struct {
 	done       chan struct{}
 	abortOnce  sync.Once
 	abort      chan struct{}
-
-	memoryBytesQuotaPerQuery int64
+	memory     *memoryManager
 
 	metrics   *controllerMetrics
 	labelKeys []string
@@ -69,12 +68,26 @@ type Controller struct {
 type Config struct {
 	// ConcurrencyQuota is the number of queries that are allowed to execute concurrently.
 	ConcurrencyQuota int
+
+	// InitialMemoryBytesQuotaPerQuery is the initial number of bytes allocated for a query
+	// when it is started. If this is unset, then the MemoryBytesQuotaPerQuery will be used.
+	InitialMemoryBytesQuotaPerQuery int64
+
 	// MemoryBytesQuotaPerQuery is the maximum number of bytes (in table memory) a query is allowed to use at
 	// any given time.
 	//
-	// The maximum amount of memory the controller is allowed to consume is
-	//   ConcurrencyQuota * MemoryBytesQuotaPerQuery
+	// A query may not be able to use its entire quota of memory if requesting more memory would conflict
+	// with the maximum amount of memory that the controller can request.
 	MemoryBytesQuotaPerQuery int64
+
+	// MaxMemoryBytes is the maximum amount of memory the controller is allowed to
+	// allocated to queries.
+	//
+	// If this is unset, then this number is ConcurrencyQuota * MemoryBytesQuotaPerQuery.
+	// This number must be greater than or equal to the ConcurrencyQuota * InitialMemoryBytesQuotaPerQuery.
+	// This number may be less than the ConcurrencyQuota * MemoryBytesQuotaPerQuery.
+	MaxMemoryBytes int64
+
 	// QueueSize is the number of queries that are allowed to be awaiting execution before new queries are
 	// rejected.
 	QueueSize int
@@ -87,6 +100,23 @@ type Config struct {
 	ExecutorDependencies []flux.Dependency
 }
 
+// complete will fill in the defaults, validate the configuration, and
+// return the new Config.
+func (c *Config) complete() (Config, error) {
+	config := *c
+	if config.InitialMemoryBytesQuotaPerQuery == 0 {
+		config.InitialMemoryBytesQuotaPerQuery = config.MemoryBytesQuotaPerQuery
+	}
+	if config.MaxMemoryBytes == 0 {
+		config.MaxMemoryBytes = int64(config.ConcurrencyQuota) * config.MemoryBytesQuotaPerQuery
+	}
+
+	if err := config.Validate(); err != nil {
+		return Config{}, err
+	}
+	return config, nil
+}
+
 func (c *Config) Validate() error {
 	if c.ConcurrencyQuota <= 0 {
 		return errors.New("ConcurrencyQuota must be positive")
@@ -94,8 +124,20 @@ func (c *Config) Validate() error {
 	if c.MemoryBytesQuotaPerQuery <= 0 {
 		return errors.New("MemoryBytesQuotaPerQuery must be positive")
 	}
+	if c.InitialMemoryBytesQuotaPerQuery <= 0 {
+		return errors.New("InitialMemoryBytesQuotaPerQuery must be positive")
+	}
+	if c.MaxMemoryBytes <= 0 {
+		return errors.New("MaxMemoryBytes must be positive")
+	}
+	if minMemory := int64(c.ConcurrencyQuota) * c.InitialMemoryBytesQuotaPerQuery; c.MaxMemoryBytes < minMemory {
+		return fmt.Errorf("MaxMemoryBytes must be greater than or equal to the ConcurrencyQuota * InitialMemoryBytesQuotaPerQuery: %d < %d (%d * %d)", c.MaxMemoryBytes, minMemory, c.ConcurrencyQuota, c.InitialMemoryBytesQuotaPerQuery)
+	}
 	if c.QueueSize <= 0 {
 		return errors.New("QueueSize must be positive")
+	}
+	if c.MaxMemoryBytes < 0 {
+		return errors.New("MaxMemoryBytes must be positive")
 	}
 	return nil
 }
@@ -103,7 +145,8 @@ func (c *Config) Validate() error {
 type QueryID uint64
 
 func New(c Config) (*Controller, error) {
-	if err := c.Validate(); err != nil {
+	c, err := c.complete()
+	if err != nil {
 		return nil, errors.Wrap(err, "invalid controller config")
 	}
 	c.MetricLabelKeys = append(c.MetricLabelKeys, orgLabel) //lint:ignore SA1029 this is a temporary ignore until we have time to create an appropriate type
@@ -113,18 +156,24 @@ func New(c Config) (*Controller, error) {
 	}
 	logger.Info("Starting query controller",
 		zap.Int("concurrency_quota", c.ConcurrencyQuota),
+		zap.Int64("initial_memory_bytes_quota_per_query", c.InitialMemoryBytesQuotaPerQuery),
 		zap.Int64("memory_bytes_quota_per_query", c.MemoryBytesQuotaPerQuery),
+		zap.Int64("max_memory_bytes", c.MaxMemoryBytes),
 		zap.Int("queue_size", c.QueueSize))
 	ctrl := &Controller{
-		queries:                  make(map[QueryID]*Query),
-		queryQueue:               make(chan *Query, c.QueueSize),
-		done:                     make(chan struct{}),
-		abort:                    make(chan struct{}),
-		memoryBytesQuotaPerQuery: c.MemoryBytesQuotaPerQuery,
-		logger:                   logger,
-		metrics:                  newControllerMetrics(c.MetricLabelKeys),
-		labelKeys:                c.MetricLabelKeys,
-		dependencies:             c.ExecutorDependencies,
+		queries:    make(map[QueryID]*Query),
+		queryQueue: make(chan *Query, c.QueueSize),
+		done:       make(chan struct{}),
+		abort:      make(chan struct{}),
+		memory: &memoryManager{
+			initialBytesQuotaPerQuery: c.InitialMemoryBytesQuotaPerQuery,
+			memoryBytesQuotaPerQuery:  c.MemoryBytesQuotaPerQuery,
+			unusedMemoryBytes:         c.MaxMemoryBytes - (int64(c.ConcurrencyQuota) * c.InitialMemoryBytesQuotaPerQuery),
+		},
+		logger:       logger,
+		metrics:      newControllerMetrics(c.MetricLabelKeys),
+		labelKeys:    c.MetricLabelKeys,
+		dependencies: c.ExecutorDependencies,
 	}
 	ctrl.wg.Add(c.ConcurrencyQuota)
 	for i := 0; i < c.ConcurrencyQuota; i++ {
@@ -326,7 +375,9 @@ func (c *Controller) processQueryQueue() {
 	}
 }
 
+// executeQuery will execute a compiled program and wait for its completion.
 func (c *Controller) executeQuery(q *Query) {
+	defer c.waitForQuery(q)
 	defer func() {
 		if e := recover(); e != nil {
 			var ok bool
@@ -355,8 +406,7 @@ func (c *Controller) executeQuery(q *Query) {
 		return
 	}
 
-	q.alloc = new(memory.Allocator)
-	q.alloc.Limit = func(v int64) *int64 { return &v }(c.memoryBytesQuotaPerQuery)
+	q.c.createAllocator(q)
 	exec, err := q.program.Start(ctx, q.alloc)
 	if err != nil {
 		q.setErr(err)
@@ -364,6 +414,14 @@ func (c *Controller) executeQuery(q *Query) {
 	}
 	q.exec = exec
 	q.pump(exec, ctx.Done())
+}
+
+// waitForQuery will wait until the query is done.
+func (c *Controller) waitForQuery(q *Query) {
+	select {
+	case <-q.doneCh:
+	case <-c.done:
+	}
 }
 
 func (c *Controller) finish(q *Query) {
@@ -461,7 +519,9 @@ type Query struct {
 	program flux.Program
 	exec    flux.Query
 	results chan flux.Result
-	alloc   *memory.Allocator
+
+	memoryManager *queryMemoryManager
+	alloc         *memory.Allocator
 }
 
 // ID reports an ephemeral unique ID for the query.
@@ -537,6 +597,11 @@ func (q *Query) Done() {
 
 		// Mark the query as finished so it is removed from the query map.
 		q.c.finish(q)
+
+		// Release the additional memory associated with this query.
+		if q.memoryManager != nil {
+			q.memoryManager.Release()
+		}
 
 		// count query request
 		if q.err != nil || len(q.runtimeErrs) > 0 {
