@@ -323,6 +323,10 @@ type userResponse struct {
 }
 
 func newUserResponse(u *influxdb.User) *userResponse {
+	if u.Status == "" {
+		u.Status = influxdb.Active
+	}
+
 	return &userResponse{
 		Links: map[string]string{
 			"self": fmt.Sprintf("/api/v2/users/%s", u.ID),
